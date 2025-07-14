@@ -1,0 +1,121 @@
+name: Deploy to Staging
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+    secrets:
+      SSH_PRIVATE_KEY_STAGING:
+        required: true
+      REMOTE_USER_API_DUCKING_STAGING:
+        required: true
+      REMOTE_HOST_STAGING:
+        required: true
+      REMOTE_PATH_API_DUCKING_STAGING:
+        required: true
+
+env:
+  PHP_VERSION: '8.2'
+  DEPLOYMENT_TARGET: 'blue'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mbstring, intl, zip, pdo, mysql, bcmath, gd, xml, curl, redis, imagick
+          tools: composer
+
+      - name: Install rsync
+        run: sudo apt-get update && sudo apt-get install -y rsync
+
+      - name: Set storage permissions
+        run: |
+          mkdir -p storage/framework/cache
+          sudo chmod -R 775 storage bootstrap/cache
+          sudo chown -R $USER:www-data storage
+
+      - name: Cache Composer packages
+        uses: actions/cache@v3
+        with:
+          path: vendor
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: Install Composer dependencies
+        run: composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: Generate release directory
+        id: release
+        run: echo "RELEASE_DIR=$(date +%Y%m%d%H%M%S)" >> $GITHUB_OUTPUT
+
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY_STAGING }}
+
+      - name: Setup remote directories
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.REMOTE_USER_API_DUCKING_STAGING }}@${{ secrets.REMOTE_HOST_STAGING }} '
+            mkdir -p ${{ secrets.REMOTE_PATH_API_DUCKING_STAGING }}/releases &&
+            mkdir -p ${{ secrets.REMOTE_PATH_API_DUCKING_STAGING }}/shared/storage &&
+            mkdir -p ${{ secrets.REMOTE_PATH_API_DUCKING_STAGING }}/blue &&
+            mkdir -p ${{ secrets.REMOTE_PATH_API_DUCKING_STAGING }}/green
+          '
+
+      - name: Deploy files
+        run: |
+          mkdir -p ${{ github.workspace }}/deploy
+          rsync -avz --exclude '.git' --exclude 'node_modules' --exclude 'tests' --exclude '.env' --exclude 'deploy' . ${{ github.workspace }}/deploy/
+          rsync -avz ${{ github.workspace }}/deploy/ ${{ secrets.REMOTE_USER_API_DUCKING_STAGING }}@${{ secrets.REMOTE_HOST_STAGING }}:${{ secrets.REMOTE_PATH_API_DUCKING_STAGING }}/releases/${{ steps.release.outputs.RELEASE_DIR }}/
+          ssh -o StrictHostKeyChecking=no ${{ secrets.REMOTE_USER_API_DUCKING_STAGING }}@${{ secrets.REMOTE_HOST_STAGING }} '
+            cp -R ${{ secrets.REMOTE_PATH_API_DUCKING_STAGING }}/releases/${{ steps.release.outputs.RELEASE_DIR }}/* ${{ secrets.REMOTE_PATH_API_DUCKING_STAGING }}/${{ env.DEPLOYMENT_TARGET }}
+          '
+
+      - name: Setup symlinks
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.REMOTE_USER_API_DUCKING_STAGING }}@${{ secrets.REMOTE_HOST_STAGING }} '
+            ln -nfs ${{ secrets.REMOTE_PATH_API_DUCKING_STAGING }}/shared/storage ${{ secrets.REMOTE_PATH_API_DUCKING_STAGING }}/${{ env.DEPLOYMENT_TARGET }}/storage &&
+            ln -nfs ${{ secrets.REMOTE_PATH_API_DUCKING_STAGING }}/.env ${{ secrets.REMOTE_PATH_API_DUCKING_STAGING }}/${{ env.DEPLOYMENT_TARGET }}/.env
+          '
+
+      - name: Run Artisan commands
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.REMOTE_USER_API_DUCKING_STAGING }}@${{ secrets.REMOTE_HOST_STAGING }} '
+            cd ${{ secrets.REMOTE_PATH_API_DUCKING_STAGING }}/${{ env.DEPLOYMENT_TARGET }} &&
+            composer dump-autoload &&
+            php artisan optimize:clear &&
+            php artisan optimize
+          '
+
+      - name: Update current symlink
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.REMOTE_USER_API_DUCKING_STAGING }}@${{ secrets.REMOTE_HOST_STAGING }} '
+            ln -nfs ${{ secrets.REMOTE_PATH_API_DUCKING_STAGING }}/${{ env.DEPLOYMENT_TARGET }} ${{ secrets.REMOTE_PATH_API_DUCKING_STAGING }}/current
+          '
+
+      - name: Cleanup old releases
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.REMOTE_USER_API_DUCKING_STAGING }}@${{ secrets.REMOTE_HOST_STAGING }} '
+            cd ${{ secrets.REMOTE_PATH_API_DUCKING_STAGING }}/releases &&
+            ls -t | tail -n +6 | xargs rm -rf || true
+          '
+
+      - name: Deployment success notification
+        if: success()
+        run: echo "✅ Staging deployment completed successfully!"
+
+      - name: Deployment failure notification
+        if: failure()
+        run: echo "❌ Staging deployment failed!"
