@@ -43,7 +43,6 @@ jobs:
       - name: Set storage permissions
         run: |
           mkdir -p storage/framework/cache
-          sudo chmod -R 775 storage bootstrap/cache
           sudo chown -R $USER:www-data storage
 
       - name: Cache Composer packages
